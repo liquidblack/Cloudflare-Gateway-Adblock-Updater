@@ -58,11 +58,11 @@ session.headers.update(headers)
 # 10000+: Hagezi filters (ordered by importance)
 blocklists: List[Dict[str, str]] = [
     {
-        "name": "Hagezi Pro",
-        "url": "https://hagezi-mirror.dnsbunker.org/wildcard/pro-onlydomains.txt",
-        "backup_url1": "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro-onlydomains.txt",
-        "backup_url2": "https://gitlab.com/hagezi/mirror/-/raw/main/dns-blocklists/wildcard/pro-onlydomains.txt",
-        "backup_url3": "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/pro-onlydomains.txt",
+        "name": "Hagezi Pro++",
+        "url": "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@main/wildcard/pro.plus-onlydomains.txt",
+        "backup_url1": "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro.plus-onlydomains.txt",
+        "backup_url2": "https://gitlab.com/hagezi/mirror/-/raw/main/dns-blocklists/wildcard/pro.plus-onlydomains.txt",
+        "backup_url3": "https://hagezi-mirror.dnsbunker.org/wildcard/pro.plus-onlydomains.txt",
         "priority": 10000
     }
 ]
@@ -514,81 +514,58 @@ async def async_update_policy(session: aiohttp.ClientSession, policy_id: str,
 def update_policy_for_filter(filter_config: Dict, final_list_ids: List[str], 
                              target_domain_count: int, cached_rules: List[Dict],
                              version: Optional[str] = None) -> bool:
-    """Update or create the policy for a filter with version info in description"""
+    """Creates multiple Gateway policies if lists exceed expression payload limits (~80 lists per policy)."""
     filter_name = filter_config["name"]
-    policy_name = filter_name
 
     if not final_list_ids:
         logger.warning(f"⚠️ Total list count is 0! Skipping policy update.")
         return False
 
-    # Build traffic expression
-    expression = " or ".join([f"any(dns.domains[*] in ${lid})" for lid in final_list_ids])
-    priority = filter_config.get('priority', 99)
-    
-    # Build description with version info
-    description = build_description_with_version(
-        filter_name, 
-        len(final_list_ids), 
-        target_domain_count, 
-        version
-    )
-    
-    policy_payload = {
-        "action": "block",
-        "description": description,
-        "enabled": True,
-        "filters": ["dns"],
-        "name": policy_name,
-        "precedence": priority,
-        "traffic": expression
-    }
+    # Split list IDs into chunks of 80 to keep policy traffic expressions short
+    POLICY_CHUNK_SIZE = 80
+    list_chunks = list(chunker(final_list_ids, POLICY_CHUNK_SIZE))
+    total_policies = len(list_chunks)
 
-    # Check if policy exists to determine POST or PUT
-    existing_policy = next((rule for rule in cached_rules if rule['name'] == policy_name), None)
-    
-    if existing_policy:
-        logger.info(f"✍️ Updating existing policy '{policy_name}'...")
-        async def run_update():
-             # Create a new session for this operation
-            async with aiohttp.ClientSession(headers=headers) as session:
-                return await async_update_policy(session, existing_policy['id'], policy_payload)
-        return asyncio.run(run_update())
-    else:
-        logger.info(f"✍️ Creating new policy '{policy_name}'...")
-        # Fallback to sync request for creation as we didn't make an async helper for simple POST rule
-        try:
-            response = api_request('POST', f"{base_url}/rules", policy_payload)
-            data = response.json()
-            
-            # Handle 409 Conflict - policy exists but wasn't in cached_rules
-            if response.status_code == 409:
-                logger.warning(f"⚠️ Policy '{policy_name}' already exists (409 Conflict)")
-                logger.info(f"🔄 Attempting to find and update existing policy...")
-                
-                # Refresh cached_rules to get the policy that exists
-                try:
-                    refreshed_rules = get_all_paginated(f"{base_url}/rules")
-                    existing_policy = next((rule for rule in refreshed_rules if rule['name'] == policy_name), None)
-                    
-                    if existing_policy:
-                        logger.info(f"✍️ Found existing policy, updating it...")
-                        async def run_update():
-                            async with aiohttp.ClientSession(headers=headers) as session:
-                                return await async_update_policy(session, existing_policy['id'], policy_payload)
-                        return asyncio.run(run_update())
-                    else:
-                        logger.error(f"🚫 Policy '{policy_name}' returned 409 but still not found after refresh")
-                        return False
-                except Exception as refresh_error:
-                    logger.error(f"🚫 Failed to refresh rules: {refresh_error}")
-                    return False
-            
-            check_api_response(response, f"creating policy {policy_name}")
-            return True
-        except Exception as e:
-            logger.error(f"🚫 Error creating policy {policy_name}: {e}")
-            return False
+    success_all = True
+    base_priority = filter_config.get('priority', 10000)
+
+    for i, chunk in enumerate(list_chunks, 1):
+        policy_name = f"{filter_name} Part {i}" if total_policies > 1 else filter_name
+        expression = " or ".join([f"any(dns.domains[*] in ${lid})" for lid in chunk])
+        
+        description = f"Block domains from {filter_name} Part {i}/{total_policies} ({len(chunk)} lists)"
+        if version:
+            description += f", Version: {version}"
+
+        policy_payload = {
+            "action": "block",
+            "description": description,
+            "enabled": True,
+            "filters": ["dns"],
+            "name": policy_name,
+            "precedence": base_priority + i,
+            "traffic": expression
+        }
+
+        existing_policy = next((rule for rule in cached_rules if rule['name'] == policy_name), None)
+
+        if existing_policy:
+            logger.info(f"✍️ Updating existing policy '{policy_name}'...")
+            async def run_update():
+                async with aiohttp.ClientSession(headers=headers) as session:
+                    return await async_update_policy(session, existing_policy['id'], policy_payload)
+            if not asyncio.run(run_update()):
+                success_all = False
+        else:
+            logger.info(f"✍️ Creating new policy '{policy_name}'...")
+            try:
+                response = api_request('POST', f"{base_url}/rules", policy_payload)
+                check_api_response(response, f"creating policy {policy_name}")
+            except Exception as e:
+                logger.error(f"🚫 Error creating policy {policy_name}: {e}")
+                success_all = False
+
+    return success_all
 
 def process_filter_async(filter_config: Dict, cached_lists: List[Dict], 
                         cached_rules: List[Dict]) -> Dict:
