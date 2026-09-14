@@ -559,9 +559,35 @@ def update_policy_for_filter(filter_config: Dict, final_list_ids: List[str],
         # Fallback to sync request for creation as we didn't make an async helper for simple POST rule
         try:
             response = api_request('POST', f"{base_url}/rules", policy_payload)
+            data = response.json()
+            
+            # Handle 409 Conflict - policy exists but wasn't in cached_rules
+            if response.status_code == 409:
+                logger.warning(f"⚠️ Policy '{policy_name}' already exists (409 Conflict)")
+                logger.info(f"🔄 Attempting to find and update existing policy...")
+                
+                # Refresh cached_rules to get the policy that exists
+                try:
+                    refreshed_rules = get_all_paginated(f"{base_url}/rules")
+                    existing_policy = next((rule for rule in refreshed_rules if rule['name'] == policy_name), None)
+                    
+                    if existing_policy:
+                        logger.info(f"✍️ Found existing policy, updating it...")
+                        async def run_update():
+                            async with aiohttp.ClientSession(headers=headers) as session:
+                                return await async_update_policy(session, existing_policy['id'], policy_payload)
+                        return asyncio.run(run_update())
+                    else:
+                        logger.error(f"🚫 Policy '{policy_name}' returned 409 but still not found after refresh")
+                        return False
+                except Exception as refresh_error:
+                    logger.error(f"🚫 Failed to refresh rules: {refresh_error}")
+                    return False
+            
             check_api_response(response, f"creating policy {policy_name}")
             return True
-        except:
+        except Exception as e:
+            logger.error(f"🚫 Error creating policy {policy_name}: {e}")
             return False
 
 def process_filter_async(filter_config: Dict, cached_lists: List[Dict], 
